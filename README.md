@@ -1,6 +1,6 @@
 # PG-Net 
 
-# Acknowledgement
+## Acknowledgement
 This code is borrowed from [PointDSC](https://github.com/XuyangBai/PointDSC). If using the part of code related to data generation, testing and evaluation, please cite these papers:
 ```
 @article{bai2021pointdsc,
