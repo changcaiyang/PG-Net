@@ -7,4 +7,4 @@ This code is borrowed from PointDSC. If using the part of code related to data g
   author={Xuyang Bai, Zixin Luo, Lei Zhou, Hongkai Chen, Lei Li, Zeyu Hu, Hongbo Fu and Chiew-Lan Tai},
   journal={CVPR},
   year={2021}
-}```
+}
