@@ -2,7 +2,7 @@
 PyTorch implementation of PG-Net for TGRS'2023 paper "[PG-Net: Progressive Guidance Network via Robust Contextual Embedding for Efficient Point Cloud Registration](https://ieeexplore.ieee.org/abstract/document/10098825)", by Jingtao Wang, Xin Liu, Luanyuan Dai, Jiayi Ma, Lifang Wei, Changcai Yang and Riqing Chen.
 This paper focus on outlier rejection for 3D point clouds registration. If you find this project useful, please cite:
 ```
-@article{10098825,
+@article{wang2023pg,
   title={PG-Net: Progressive Guidance Network via Robust Contextual Embedding for Efficient Point Cloud Registration}, 
   author={Wang, Jingtao and Liu, Xin and Dai, Luanyuan and Ma, Jiayi and Wei, Lifang and Yang, Changcai and Chen, Riqing},
   journal={IEEE Transactions on Geoscience and Remote Sensing}, 
