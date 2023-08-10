@@ -11,7 +11,8 @@ This paper focus on outlier rejection for 3D point clouds registration. If you f
   number={},
   pages={1-12},
   doi={10.1109/TGRS.2023.3266285}
-}
+}```
+
 ## Acknowledgement
 This code is borrowed from [PointDSC](https://github.com/XuyangBai/PointDSC). If using the part of code related to data generation, testing and evaluation, please cite these papers:
 ```
