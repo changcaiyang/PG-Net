@@ -4,25 +4,156 @@ import torch.nn.functional as F
 import numpy as np
 from models.common import knn, rigid_transform_3d
 from utils.SE3 import transform
+from models.pairwise_distance import pairwise_distance
+from models.positional_embedding import SinusoidalPositionalEmbedding
 
 
-class NonLocalBlock(nn.Module):
-    def __init__(self, num_channels=128, num_heads=1):
-        super(NonLocalBlock, self).__init__()
-        self.fc_message = nn.Sequential(
+class SpatialAttention(nn.Module):
+    def __init__(self):
+        super(SpatialAttention, self).__init__()
+        self.conv1 = nn.Conv1d(2, 1, kernel_size=1)  # concat完channel维度为2
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        def global_std_pool2d(x):
+            """2D global standard variation pooling"""
+            return torch.std(x, dim=1, keepdim=True)
+
+        avg_out = torch.mean(x, dim=1, keepdim=True)  # 沿着channel 维度计算均值和最大值
+        std_pool = global_std_pool2d(x)
+        x = torch.cat([avg_out, std_pool], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)
+
+
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.max_pool = nn.AdaptiveMaxPool1d(1)
+
+        self.fc1 = nn.Conv1d(in_planes, in_planes // 16, 1, bias=False)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Conv1d(in_planes // 16, in_planes, 1, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        def global_std_pool2d(x):
+            """2D global standard variation pooling"""
+            return torch.std(x, dim=2, keepdim=True)
+
+        std_pool = global_std_pool2d(x)
+        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+        std_out = self.fc2(self.relu1(self.fc1(std_pool)))
+        out = avg_out + std_out
+        return self.sigmoid(out)
+
+class GDFA(nn.Module):
+    def __init__(self, channels, out_channels=None):
+        nn.Module.__init__(self)
+        sub_channels = channels // 4
+        self.conv1 = nn.Sequential(
+            nn.InstanceNorm1d(sub_channels, eps=1e-3),
+            nn.BatchNorm1d(sub_channels),
+            nn.ReLU(),
+            nn.Conv1d(sub_channels, sub_channels, kernel_size=1),
+        )
+        self.conv2 = nn.Sequential(
+            nn.InstanceNorm1d(sub_channels, eps=1e-3),
+            nn.BatchNorm1d(sub_channels),
+            nn.ReLU(),
+            nn.Conv1d(sub_channels, sub_channels, kernel_size=1),
+        )
+        self.conv3 = nn.Sequential(
+            nn.InstanceNorm1d(sub_channels, eps=1e-3),
+            nn.BatchNorm1d(sub_channels),
+            nn.ReLU(),
+            nn.Conv1d(sub_channels, sub_channels, kernel_size=1),
+        )
+        self.conv4 = nn.Sequential(
+            nn.InstanceNorm1d(sub_channels, eps=1e-3),
+            nn.BatchNorm1d(sub_channels),
+            nn.ReLU(),
+            nn.Conv1d(sub_channels, sub_channels, kernel_size=1),
+        )
+        self.CA = ChannelAttention(channels)
+
+    def channel_shuffle(self, x, groups):
+        batchsize, num_channels, num_corr = x.data.size()
+
+        channels_per_group = num_channels // groups
+
+        # reshape
+        x = x.view(batchsize, groups,
+                   channels_per_group, num_corr)
+
+        # transpose
+        # - contiguous() required if transpose() is used before view().
+        #   See https://github.com/pytorch/pytorch/issues/764
+        x = torch.transpose(x, 1, 2).contiguous()
+
+        # flatten
+        x = x.view(batchsize, -1, num_corr)
+
+        return x
+
+    def forward(self, x):
+        spx = torch.split(x, 32, 1)
+        sp1 = self.conv1(spx[0])
+
+        sp2 = sp1 + spx[1] + spx[0]
+        sp2 = self.conv2(sp2)
+
+        sp3 = sp2 + spx[2] + spx[1] + spx[0]
+        sp3 = self.conv3(sp3)
+
+        sp4 = sp3 + spx[3] + spx[2] + spx[1] + spx[0]
+        sp4 = self.conv4(sp4)
+
+        out = torch.cat((sp1, sp2, sp3, sp4), 1)
+        out = out + x
+        out = self.channel_shuffle(out, 4)
+        return out
+
+class SCNonLocalA(nn.Module):
+    def __init__(self, num_channels=128, num_heads=1, psp_size=(1,3,6,8)):
+        super(SCNonLocalA, self).__init__()
+
+        self.fc_message1 = nn.Sequential(
             nn.Conv1d(num_channels, num_channels // 2, kernel_size=1),
+            nn.InstanceNorm1d(num_channels // 2, eps=1e-3),
             nn.BatchNorm1d(num_channels // 2),
             nn.ReLU(inplace=True),
             nn.Conv1d(num_channels // 2, num_channels // 2, kernel_size=1),
+            nn.InstanceNorm1d(num_channels // 2, eps=1e-3),
             nn.BatchNorm1d(num_channels // 2),
             nn.ReLU(inplace=True),
             nn.Conv1d(num_channels // 2, num_channels, kernel_size=1),
         )
-        self.projection_q = nn.Conv1d(num_channels, num_channels, kernel_size=1)
-        self.projection_k = nn.Conv1d(num_channels, num_channels, kernel_size=1)
-        self.projection_v = nn.Conv1d(num_channels, num_channels, kernel_size=1)
+        self.projection_q = nn.Sequential(
+            nn.InstanceNorm1d(num_channels, eps=1e-3),
+            nn.BatchNorm1d(num_channels),
+            nn.ReLU(),
+            nn.Conv1d(num_channels, num_channels, kernel_size=1),
+        )
+        self.projection_k = nn.Sequential(
+            nn.InstanceNorm1d(num_channels, eps=1e-3),
+            nn.BatchNorm1d(num_channels),
+            nn.ReLU(),
+            nn.Conv1d(num_channels, num_channels, kernel_size=1),
+        )
+        self.projection_v = nn.Sequential(
+            nn.InstanceNorm1d(num_channels, eps=1e-3),
+            nn.BatchNorm1d(num_channels),
+            nn.ReLU(),
+            nn.Conv1d(num_channels, num_channels, kernel_size=1),
+        )
+
         self.num_channels = num_channels
         self.head = num_heads
+
+        self.CA = ChannelAttention(num_channels)
+        self.SA = SpatialAttention()
 
     def forward(self, feat, attention):
         """
@@ -37,30 +168,29 @@ class NonLocalBlock(nn.Module):
         K = self.projection_k(feat).view([bs, self.head, self.num_channels // self.head, num_corr])
         V = self.projection_v(feat).view([bs, self.head, self.num_channels // self.head, num_corr])
         feat_attention = torch.einsum('bhco, bhci->bhoi', Q, K) / (self.num_channels // self.head) ** 0.5
-        # combine the feature similarity with spatial consistency
         weight = torch.softmax(attention[:, None, :, :] * feat_attention, dim=-1)
         message = torch.einsum('bhoi, bhci-> bhco', weight, V).reshape([bs, -1, num_corr])
-        message = self.fc_message(message)
-        res = feat + message
-        return res
+        message = self.fc_message1(message)
+        w_ca = self.CA(message)
+        out_c = w_ca * message
 
-
-class NonLocalNet(nn.Module):
+        w_sa = self.SA(out_c)
+        out_s = w_sa * out_c
+        out = feat + out_s
+        return out
+       
+class CEBlock(nn.Module):
     def __init__(self, in_dim=6, num_layers=6, num_channels=128):
-        super(NonLocalNet, self).__init__()
+        super(CEBlock, self).__init__()
         self.num_layers = num_layers
-
         self.blocks = nn.ModuleDict()
         self.layer0 = nn.Conv1d(in_dim, num_channels, kernel_size=1, bias=True)
+        self.CA = ChannelAttention(num_channels)
+        self.SA = SpatialAttention()
         for i in range(num_layers):
-            layer = nn.Sequential(
-                nn.Conv1d(num_channels, num_channels, kernel_size=1, bias=True),
-                # nn.InstanceNorm1d(num_channels),
-                nn.BatchNorm1d(num_channels),
-                nn.ReLU(inplace=True)
-            )
+            layer = GDFA(num_channels)
             self.blocks[f'PointCN_layer_{i}'] = layer
-            self.blocks[f'NonLocal_layer_{i}'] = NonLocalBlock(num_channels)
+            self.blocks[f'NonLocal_layer_{i}'] = SCNonLocalA(num_channels)
 
     def forward(self, corr_feat, corr_compatibility):
         """
@@ -72,10 +202,14 @@ class NonLocalNet(nn.Module):
         """
         feat = self.layer0(corr_feat)
         for i in range(self.num_layers):
-            feat = self.blocks[f'PointCN_layer_{i}'](feat)
+            message = self.blocks[f'PointCN_layer_{i}'](feat)
+            ca = self.CA(message)
+            out_ca = ca * message
+            sa = self.SA(out_ca)
+            out_sa = sa * out_ca
+            feat = feat + out_sa
             feat = self.blocks[f'NonLocal_layer_{i}'](feat, corr_compatibility)
         return feat
-
 
 class PGNet(nn.Module):
     def __init__(self,
@@ -86,8 +220,15 @@ class PGNet(nn.Module):
                  ratio=0.1,
                  inlier_threshold=0.10,
                  sigma_d=0.10,
-                 k=40,
+                 sigma_a=3.20,
+                 k=30,
                  nms_radius=0.10,
+                 use_mutal=True,
+                 d_thre=0.1,
+                 max_points=8000,
+                 k1=30,
+                 k2=20,
+                 select_scene=None,
                  ):
         super(PGNet, self).__init__()
         self.num_iterations = num_iterations  # maximum iteration of power iteration algorithm
@@ -98,7 +239,14 @@ class PGNet(nn.Module):
         self.sigma_spat = nn.Parameter(torch.Tensor([sigma_d]).float(), requires_grad=False)
         self.k = k  # neighborhood number in NSM module.
         self.nms_radius = nms_radius  # only used during testing
-        self.encoder = NonLocalNet(
+        self.max_points = max_points
+        self.k1 = k1
+        self.k2 = k2
+        self.d_thre = d_thre
+        self.factor_a = 180.0 / (15 * np.pi)
+        self.out = nn.Conv1d(num_channels, 1, kernel_size=1)
+        self.layer1 = nn.Conv1d(7, 6, kernel_size=1, bias=True)
+        self.encoder = CEBlock(
             in_dim=in_dim,
             num_layers=num_layers,
             num_channels=num_channels,
@@ -119,11 +267,6 @@ class PGNet(nn.Module):
             elif isinstance(m, (nn.BatchNorm1d)):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
-
-        # add gradient clipping
-        # grad_clip_norm = 100
-        # for p in self.parameters():
-        #     p.register_hook(lambda grad: torch.clamp(grad, -grad_clip_norm, grad_clip_norm))
 
     def forward(self, data):
         """
@@ -148,45 +291,44 @@ class PGNet(nn.Module):
         # Step1: extract feature for each correspondence
         #################################
         with torch.no_grad():
-            src_dist = torch.norm((src_keypts[:, :, None, :] - src_keypts[:, None, :, :]), dim=-1)
-            # tgt_dist = torch.norm((tgt_keypts[:, :, None, :] - tgt_keypts[:, None, :, :]), dim=-1)
-            # corr_compatibility = torch.min(
-            # torch.stack((src_dist / (tgt_dist + 1e-12), tgt_dist / (src_dist + 1e-12)), dim=-1),
-            # dim=-1).values + torch.eye(src_dist.shape[-1]).to(src_dist)
-            # corr_compatibility = torch.clamp((corr_compatibility / 0.9) ** 2, min=0)
-            corr_compatibility = src_dist - torch.norm((tgt_keypts[:, :, None, :] - tgt_keypts[:, None, :, :]), dim=-1)
+            src_dist = torch.norm((src_keypts[:, :, None, :] - src_keypts[:, None, :, :]), dim=-1) #[1, 5182, 5182]
+            corr_compatibility = src_dist - torch.norm((tgt_keypts[:, :, None, :] - tgt_keypts[:, None, :, :]),
+                                                       dim=-1)
             corr_compatibility = torch.clamp(1.0 - corr_compatibility ** 2 / self.sigma_spat ** 2, min=0)
-        '''# Compute distances and angles between source keypoints
-        src_dist = torch.norm((src_keypts[:, :, None, :] - src_keypts[:, None, :, :]), dim=-1)
-        src_angles = torch.atan2(src_keypts[:, :, None, 1] - src_keypts[:, None, :, 1],
-                                 src_keypts[:, :, None, 0] - src_keypts[:, None, :, 0])
-
-        # Compute distances and angles between target keypoints
-        tgt_dist = torch.norm((tgt_keypts[:, :, None, :] - tgt_keypts[:, None, :, :]), dim=-1)
-        tgt_angles = torch.atan2(tgt_keypts[:, :, None, 1] - tgt_keypts[:, None, :, 1],
-                                 tgt_keypts[:, :, None, 0] - tgt_keypts[:, None, :, 0])
-
-        # Compute compatibility scores based on spatial and angular distance
-        spatial_comp = src_dist - tgt_dist
-        angular_comp = src_angles - tgt_angles
-
-        # Normalize spatial and angular compatibility scores
-        spatial_comp = spatial_comp / self.sigma_spat
-        angular_comp = angular_comp / self.sigma_angle
-
-        # Compute combined compatibility scores
-        corr_compatibility = 1.0 - (spatial_comp ** 2 + angular_comp ** 2)
-        corr_compatibility = torch.clamp(corr_compatibility, min=0)'''
-        '''src_vecs = src_keypts[:, :, None, :] - src_keypts[:, None, :, :]
-        tgt_vecs = tgt_keypts[:, :, None, :] - tgt_keypts[:, None, :, :]
-        dot_prods = torch.sum(src_vecs / torch.norm(src_vecs, dim=-1, keepdim=True) * tgt_vecs / torch.norm(tgt_vecs, dim=-1,
-                                                                                          keepdim=True), dim=-1)
-        dot_prods = torch.clamp(dot_prods, min=-1, max=1)
-        angles = torch.acos(dot_prods)
-        compatibility = torch.clamp(1.0 - src_dist ** 2 / self.sigma_spat ** 2 - angles ** 2 / self.sigma_ang ** 2,
-                                    min=0)'''
 
         corr_features = self.encoder(corr_pos.permute(0, 2, 1), corr_compatibility).permute(0, 2, 1)
+        normed_corr_features = F.normalize(corr_features, p=2, dim=-1)
+
+        if not testing:  # during training or validation
+                # construct the feature similarity matrix M for loss calculation
+            M = torch.matmul(normed_corr_features, normed_corr_features.permute(0, 2, 1))
+            M = torch.clamp(1 - (1 - M) / self.sigma ** 2, min=0, max=1)
+                # set diagnal of M to zero
+            M[:, torch.arange(M.shape[1]), torch.arange(M.shape[1])] = 0
+        else:
+            M = None
+
+            #################################
+        # Step 2.1: estimate initial confidence by MLP, find highly confident and well-distributed points as seeds.
+        #################################
+        #confidence = self.cal_leading_eigenvector(M.to(corr_pos.device), method='power')
+        confidence = self.classification(corr_features.permute(0, 2, 1)).squeeze(1)
+
+        if testing:
+            seeds = self.pick_seeds(src_dist, confidence, R=self.nms_radius, max_num=int(num_corr * self.ratio))
+        else:
+            seeds = torch.argsort(confidence, dim=1, descending=True)[:, 0:int(num_corr * self.ratio)]
+
+        #################################
+        # Step 3 & 4: calculate transformation matrix for each seed, and find the best hypothesis.
+        #################################
+        seed_trans, seed_fitness, final_trans, final_labels, final_labels1 = self.cal_seed_trans(seeds, normed_corr_features,
+                                                                                  src_keypts, tgt_keypts)
+
+        final_labels1 = final_labels1.unsqueeze(1)  # [1,1,12000]
+        out = torch.cat([corr_pos.permute(0, 2, 1), final_labels1.detach()], dim=1)
+        out = self.layer1(out)
+        corr_features = self.encoder(out, corr_compatibility).permute(0, 2, 1)
         normed_corr_features = F.normalize(corr_features, p=2, dim=-1)
 
         if not testing:  # during training or validation
@@ -198,10 +340,6 @@ class PGNet(nn.Module):
         else:
             M = None
 
-            #################################
-        # Step 2.1: estimate initial confidence by MLP, find highly confident and well-distributed points as seeds.
-        #################################
-        # confidence = self.cal_leading_eigenvector(M.to(corr_pos.device), method='power')
         confidence = self.classification(corr_features.permute(0, 2, 1)).squeeze(1)
 
         if testing:
@@ -209,12 +347,8 @@ class PGNet(nn.Module):
         else:
             seeds = torch.argsort(confidence, dim=1, descending=True)[:, 0:int(num_corr * self.ratio)]
 
-        #################################
-        # Step 3 & 4: calculate transformation matrix for each seed, and find the best hypothesis.
-        #################################
-        seed_trans, seed_fitness, final_trans, final_labels = self.cal_seed_trans(seeds, normed_corr_features,
+        seed_trans, seed_fitness, final_trans, final_labels, final_labels1 = self.cal_seed_trans(seeds, normed_corr_features,
                                                                                   src_keypts, tgt_keypts)
-        #residual = batch_episym(src_keypts, tgt_keypts, final_trans)
 
         # post refinement (only used during testing and bs == 1)
         if testing:
@@ -251,27 +385,12 @@ class PGNet(nn.Module):
         is_local_max = score_relation.min(-1)[0].float()
         return torch.argsort(scores * is_local_max, dim=1, descending=True)[:, 0:max_num].detach()
 
-        # # greedy Non Maximum Suppression
-        # picked_seeds = []
-        # selected_mask = torch.zeros_like(scores[0])
-        # iter_num = 0
-        # # if all the points are selected or the left points are all outlier, break
-        # while torch.sum(selected_mask) != selected_mask.shape[0] and torch.sum(leading_eig[0] * (1 - selected_mask)) != 0:
-        #     select_ind = torch.argmax(scores[0] * (1 - selected_mask))
-        #     distance = torch.norm(src_keypts[0] - src_keypts[0, select_ind:select_ind + 1, :], dim=-1)
-        #     selected_mask[distance < R] = 1
-        #     picked_seeds.append(int(select_ind))
-        #     iter_num += 1
-        #     if iter_num > max_num:
-        #         break
-        # return torch.from_numpy(np.array(picked_seeds))[None, :].to(scores.device)
-
     def cal_seed_trans(self, seeds, corr_features, src_keypts, tgt_keypts):
         """
         Calculate the transformation for each seeding correspondences.
         Input:
             - seeds:         [bs, num_seeds]              the index to the seeding correspondence
-            - corr_features: [bs, num_corr, num_channels]
+            - corr_features: [bs, num_corr, num_channels] [1,5182,128]
             - src_keypts:    [bs, num_corr, 3]
             - tgt_keypts:    [bs, num_corr, 3]
         Output: leading eigenvector
@@ -283,8 +402,8 @@ class PGNet(nn.Module):
         bs, num_corr, num_channels = corr_features.shape[0], corr_features.shape[1], corr_features.shape[2]
         num_seeds = seeds.shape[-1]
         k = min(self.k, num_corr - 1)
-        knn_idx = knn(corr_features, k=k, ignore_self=True, normalized=True)  # [bs, num_corr, k]
-        knn_idx = knn_idx.gather(dim=1, index=seeds[:, :, None].expand(-1, -1, k))  # [bs, num_seeds, k]
+        knn_idx = knn(corr_features, k=k, ignore_self=True, normalized=True)  # [bs, num_corr, k] [1,5182,40]
+        knn_idx = knn_idx.gather(dim=1, index=seeds[:, :, None].expand(-1, -1, k))  # [bs, num_seeds, k] [1,518,40]
 
         #################################
         # construct the feature consistency matrix of each correspondence subset.
@@ -293,44 +412,69 @@ class PGNet(nn.Module):
                                             index=knn_idx.view([bs, -1])[:, :, None].expand(-1, -1, num_channels)).view(
             [bs, -1, k, num_channels])  # [bs, num_seeds, k, num_channels]
         knn_M = torch.matmul(knn_features, knn_features.permute(0, 1, 3, 2))
-        knn_M = torch.clamp(1 - (1 - knn_M) / self.sigma ** 2, min=0)
-        knn_M = knn_M.view([-1, k, k])
+        knn_M = torch.clamp(1 - (1 - knn_M) / self.sigma ** 2, min=0)#[1,518,40,40]
+        #knn_M = knn_M.view([-1, k, k])
         feature_knn_M = knn_M
 
         #################################
         # construct the spatial consistency matrix of each correspondence subset.
         #################################
         src_knn = src_keypts.gather(dim=1, index=knn_idx.view([bs, -1])[:, :, None].expand(-1, -1, 3)).view(
-            [bs, -1, k, 3])  # [bs, num_seeds, k, 3]
+            [bs, -1, k, 3])  # [bs, num_seeds, k, 3] [1,518,40,3]
         tgt_knn = tgt_keypts.gather(dim=1, index=knn_idx.view([bs, -1])[:, :, None].expand(-1, -1, 3)).view(
             [bs, -1, k, 3])
         knn_M = ((src_knn[:, :, :, None, :] - src_knn[:, :, None, :, :]) ** 2).sum(-1) ** 0.5 - (
                     (tgt_knn[:, :, :, None, :] - tgt_knn[:, :, None, :, :]) ** 2).sum(-1) ** 0.5
         # knn_M = torch.max(torch.zeros_like(knn_M), 1.0 - knn_M ** 2 / self.sigma_spat ** 2)
-        knn_M = torch.clamp(1 - knn_M ** 2 / self.sigma_spat ** 2, min=0)
-        knn_M = knn_M.view([-1, k, k])
+        knn_M = torch.clamp(1 - knn_M ** 2 / self.sigma_spat ** 2, min=0)#[1,518,40,40]
+        #knn_M = knn_M.view([-1, k, k]) #[518,40,40]
         spatial_knn_M = knn_M
 
         #################################
         # Power iteratation to get the inlier probability
         #################################
         total_knn_M = feature_knn_M * spatial_knn_M
+        total_knn_M = torch.matmul(total_knn_M[:, :, :1, :], total_knn_M)
+
+        k1 = self.k1
+        k2 = self.k2
+
+        if k1 > num_channels:
+            k1 = 4
+            k2 = 4
+        sorted_score = torch.argsort(total_knn_M, dim=3, descending=True)
+        knn_idx_fine = sorted_score[:, :, :, 0: k2]#[1,518,40,40]
+        num = knn_idx_fine.shape[1]
+        #src_knn_fine = src_knn.gather(dim=1, index=knn_idx_fine.view([bs, num, -1])[:, :, :, None].expand(-1, -1, -1, 3)).view([bs, -1, k2, 3])
+        #tgt_knn_fine = tgt_knn.gather(dim=1, index=knn_idx_fine.view([bs, num, -1])[:, :, :, None].expand(-1, -1, -1, 3)).view([bs, -1, k2, 3])
+        knn_idx_fine = knn_idx_fine.contiguous().view([bs, num, -1])[:, :, :, None]#[1,518,40,40]
+        knn_idx_fine = knn_idx_fine.expand(-1, -1, -1, 3)#[1,518,1200,3]
+        src_knn_fine = src_knn.gather(dim=2, index=knn_idx_fine).view([bs, -1, k2, 3])  #[1,20720,40,3] [bs, num_seeds, k, 3]
+        tgt_knn_fine = tgt_knn.gather(dim=2, index=knn_idx_fine).view([bs, -1, k2, 3])
+        knn_M = ((src_knn_fine[:, :, :, None, :] - src_knn_fine[:, :, None, :, :]) ** 2).sum(-1) ** 0.5 - (
+                (tgt_knn_fine[:, :, :, None, :] - tgt_knn_fine[:, :, None, :, :]) ** 2).sum(-1) ** 0.5
+        # knn_M = torch.max(torch.zeros_like(knn_M), 1.0 - knn_M ** 2 / self.sigma_spat ** 2)
+        knn_M = torch.clamp(1 - knn_M ** 2 / self.sigma_spat ** 2, min=0)  # [1,518,40,40]
+        knn_M = knn_M.view([-1, k2, k2]) #[518,40,40]
+        spatial_knn_M = knn_M
+
+
+        total_knn_M = spatial_knn_M
+
         total_knn_M[:, torch.arange(total_knn_M.shape[1]), torch.arange(total_knn_M.shape[1])] = 0
         # total_knn_M = self.gamma * feature_knn_M + (1 - self.gamma) * spatial_knn_M
         total_weight = self.cal_leading_eigenvector(total_knn_M, method='power')
-        total_weight = total_weight.view([bs, -1, k])
+        total_weight = total_weight.view([bs, -1, k2])
         total_weight = total_weight / (torch.sum(total_weight, dim=-1, keepdim=True) + 1e-6)
 
         #################################
         # calculate the transformation by weighted least-squares for each subsets in parallel
         #################################
-        total_weight = total_weight.view([-1, k])
+        total_weight = total_weight.view([-1, k2])
 
-        src_knn = src_keypts.gather(dim=1, index=knn_idx.view([bs, -1])[:, :, None].expand(-1, -1, 3)).view(
-            [bs, -1, k, 3])  # [bs, num_seeds, k, 3]
-        tgt_knn = tgt_keypts.gather(dim=1, index=knn_idx.view([bs, -1])[:, :, None].expand(-1, -1, 3)).view(
-            [bs, -1, k, 3])  # [bs, num_seeds, k, 3]
-        src_knn, tgt_knn = src_knn.view([-1, k, 3]), tgt_knn.view([-1, k, 3])
+        src_knn = src_knn_fine
+        tgt_knn = tgt_knn_fine
+        src_knn, tgt_knn = src_knn.view([-1, k2, 3]), tgt_knn.view([-1, k2, 3])
         seed_as_center = False
 
         if seed_as_center:
@@ -378,8 +522,9 @@ class PGNet(nn.Module):
                                             index=batch_best_guess[:, None, None, None].expand(-1, -1, 4, 4)).squeeze(1)
         final_labels = L2_dis.gather(dim=1,
                                      index=batch_best_guess[:, None, None].expand(-1, -1, L2_dis.shape[2])).squeeze(1)
-        final_labels = (final_labels < self.inlier_threshold).float()
-        return seedwise_trans, seedwise_fitness, final_trans, final_labels
+        final_labels1 = final_labels
+        final_labels = (final_labels1 < self.inlier_threshold).float()
+        return seedwise_trans, seedwise_fitness, final_trans, final_labels, final_labels1
 
     def cal_leading_eigenvector(self, M, method='power'):
         """
@@ -421,13 +566,13 @@ class PGNet(nn.Module):
         if method == 'eig_value':
             # max eigenvalue as the confidence (Rayleigh quotient)
             max_eig_value = (leading_eig[:, None, :] @ M @ leading_eig[:, :, None]) / (
-                        leading_eig[:, None, :] @ leading_eig[:, :, None])
+                    leading_eig[:, None, :] @ leading_eig[:, :, None])
             confidence = max_eig_value.squeeze(-1)
             return confidence
         elif method == 'eig_value_ratio':
             # max eigenvalue / second max eigenvalue as the confidence
             max_eig_value = (leading_eig[:, None, :] @ M @ leading_eig[:, :, None]) / (
-                        leading_eig[:, None, :] @ leading_eig[:, :, None])
+                    leading_eig[:, None, :] @ leading_eig[:, :, None])
             # compute the second largest eigen-value
             B = M - max_eig_value * leading_eig[:, :, None] @ leading_eig[:, None, :]
             solution = torch.ones_like(B[:, :, 0:1])
@@ -437,7 +582,7 @@ class PGNet(nn.Module):
             solution = solution.squeeze(-1)
             second_eig = solution
             second_eig_value = (second_eig[:, None, :] @ B @ second_eig[:, :, None]) / (
-                        second_eig[:, None, :] @ second_eig[:, :, None])
+                    second_eig[:, None, :] @ second_eig[:, :, None])
             confidence = max_eig_value / second_eig_value
             return confidence
         elif method == 'xMx':
